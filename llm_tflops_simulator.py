@@ -5,8 +5,8 @@ import torch.nn.functional as F
 from transformers import AutoConfig
 torch.set_default_dtype(torch.float16)
 
-#model_name = "meta-llama/Meta-Llama-3-8B"
-model_name = "meta-llama/Meta-Llama-3-70B"
+#model_name = "NousResearch/Meta-Llama-3-8B"
+model_name = "NousResearch/Meta-Llama-3-70B"
 
 cfg = AutoConfig.from_pretrained(model_name)
 
@@ -23,8 +23,11 @@ if "LlamaForCausalLM" in architectures:
 else:
     raise ValueError("Unsuported model")
 
+mode = "PREFILL"
+mode = "DECODING"
+
+sl = 2048 if mode == "PREFILL" else 1
 tp = 8
-sl = 2048
 iters = 10
 warmup = 5
 data_in_byte = 2 #fp16, bf16
@@ -103,7 +106,7 @@ for bs in bs_list:
         latency_set = latency_set[warmup:]
         latency_avg = sum(latency_set) / len(latency_set)
         tflops = x0 * x1 * w1 * 2 /1e9/(latency_avg) 
-        ddr_access_G = data_in_byte * (x0 * x1 + w0 * w1 + x0 * w1)/1e9
+        ddr_access = data_in_byte * (x0 * x1 + w0 * w1 + x0 * w1)
 
-        arith_intensity = tflops / ddr_access_G * 1e3
+        arith_intensity = (x0 * x1 * w1 * 2) / ddr_access 
         print("{}:{}:{}:{}:{}".format(module, x.shape, wT.shape, tflops, arith_intensity))
