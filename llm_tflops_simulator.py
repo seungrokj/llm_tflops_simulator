@@ -5,8 +5,7 @@ import torch.nn.functional as F
 from transformers import AutoConfig
 torch.set_default_dtype(torch.float16)
 
-#model_name = "NousResearch/Meta-Llama-3-8B"
-model_name = "NousResearch/Meta-Llama-3-70B"
+model_name = "meta-llama/Meta-Llama-3.1-405B"
 
 cfg = AutoConfig.from_pretrained(model_name)
 
@@ -23,7 +22,7 @@ if "LlamaForCausalLM" in architectures:
 else:
     raise ValueError("Unsuported model")
 
-mode = "PREFILL"
+#mode = "PREFILL"
 mode = "DECODING"
 
 sl = 2048 if mode == "PREFILL" else 1
@@ -34,10 +33,18 @@ data_in_byte = 2 #fp16, bf16
 
 bs_list = [
         1,
+        2,
+        4,
         8,
         16,
         32,
-        64,
+        64
+        ]
+
+bs_list = [
+        1,
+        2,
+        4,
         ]
 
 module_list = [
@@ -85,7 +92,7 @@ for bs in bs_list:
             w1 = hidden_size
             x1, w1 = row_parallel_K (x1, w1, tp)
         x1, w1 = int(x1), int(w1)
-        w0 = x1
+        w0 = x1 # K
         x  = torch.randn(x0, x1, device="cuda:0", dtype=torch.float16)
         wT = torch.randn(w1, w0, device="cuda:0", dtype=torch.float16)
 
