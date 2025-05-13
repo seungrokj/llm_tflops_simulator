@@ -1,11 +1,20 @@
-# llama & its sibling architectures only
 import torch
 from torch import nn
+from torch.profiler import profile, record_function, ProfilerActivity
 import torch.nn.functional as F
 from transformers import AutoConfig
-torch.set_default_dtype(torch.float16)
+from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
 
-model_name = "meta-llama/Meta-Llama-3.1-405B"
+dtype=torch.bfloat16
+torch.set_default_dtype(dtype)
+profile_en=True
+profile_en=False
+device = 'cuda'
+#activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA, ProfilerActivity.XPU]
+activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
+sort_by_keyword = "self_" + device + "_time_total"
+
+model_name = "meta-llama/Llama-3.1-70B"
 
 cfg = AutoConfig.from_pretrained(model_name)
 
@@ -22,14 +31,29 @@ if "LlamaForCausalLM" in architectures:
 else:
     raise ValueError("Unsuported model")
 
-#mode = "PREFILL"
-mode = "DECODING"
+mode = "PREFILL"
+#mode = "DECODING"
 
-sl = 2048 if mode == "PREFILL" else 1
+sl = 256 if mode == "PREFILL" else 1
 tp = 8
 iters = 10
-warmup = 5
+warmup = 1
 data_in_byte = 2 #fp16, bf16
+
+#
+#bs_list = [
+#        1,
+#        2,
+#        4,
+#        ]
+#
+#module_list = [
+#            "emb",
+#            "qkv_proj",
+#            "o_proj",
+#            "gate_up_proj",
+#            "down_proj",
+#            ]
 
 bs_list = [
         1,
@@ -38,13 +62,8 @@ bs_list = [
         8,
         16,
         32,
-        64
-        ]
-
-bs_list = [
-        1,
-        2,
-        4,
+        64,
+        128
         ]
 
 module_list = [
@@ -65,55 +84,83 @@ def row_parallel_K(x, w, tp):
 def col_parallel_K(x, w, tp):
     return x, w/tp
 
-for bs in bs_list:
-    print("batch size: ", bs)
-    print("module:x.shape:wT.shape:tflops:arith_intensity")
-    for module in module_list:
+print("module:batch_seqlenq:x.shape:wT.shape:gflops:tflops:arith_intensity")
+for module in module_list:
+    for bs in bs_list:
         latency_set = []
         x0 = bs * sl
         if module == "emb": # Col
             x1 = hidden_size
-            w1 = vocab_size 
+            w1 = vocab_size
             x1, w1 = col_parallel_K (x1, w1, tp)
         elif module == "qkv_proj": # Col
             x1 = hidden_size
-            w1 = (hidden_size/num_attention_heads)*(num_attention_heads + 2 * num_key_value_heads) 
+            w1 = (hidden_size/num_attention_heads)*(num_attention_heads + 2 * num_key_value_heads)
             x1, w1 = col_parallel_K (x1, w1, tp)
         elif module == "o_proj": # Row
-            x1 = hidden_size 
-            w1 = hidden_size 
+            x1 = hidden_size
+            w1 = hidden_size
             x1, w1 = row_parallel_K (x1, w1, tp)
         elif module == "gate_up_proj": #Col
             x1 = hidden_size
-            w1 = 2 * intermediate_size 
+            w1 = 2 * intermediate_size
             x1, w1 = col_parallel_K (x1, w1, tp)
         elif module == "down_proj": # Row
-            x1 = intermediate_size 
+            x1 = intermediate_size
             w1 = hidden_size
             x1, w1 = row_parallel_K (x1, w1, tp)
         x1, w1 = int(x1), int(w1)
         w0 = x1 # K
-        x  = torch.randn(x0, x1, device="cuda:0", dtype=torch.float16)
-        wT = torch.randn(w1, w0, device="cuda:0", dtype=torch.float16)
+        x  = torch.randn(x0, x1, device="cuda:0", dtype=dtype)
+        wT = torch.randn(w1, w0, device="cuda:0", dtype=dtype)
 
         with torch.no_grad():
-            for itr in range(iters):
-                start_event = torch.cuda.Event(enable_timing=True)
-                end_event = torch.cuda.Event(enable_timing=True)
-                torch.cuda.synchronize()
-                start_event.record()
+            if profile_en:
+                for itr in range(iters):
+                    with profile(
+                    activities=activities,
+                    #with_stack=True,
+                    #record_shapes=True,
+                    with_flops=True,
+                    with_modules=True,
+                    profile_memory=True,
+                ) as prof:
+                        start_event = torch.cuda.Event(enable_timing=True)
+                        end_event = torch.cuda.Event(enable_timing=True)
+                        torch.cuda.synchronize()
+                        start_event.record()
 
-                out = F.linear(x, wT)
+                        #out = F.linear(x, wT)
+                        out = dispatch_unquantized_gemm()(x, wT, None)
 
-                end_event.record()
-                torch.cuda.synchronize()
-                time = start_event.elapsed_time(end_event)
-                latency_set.append(time)
+                        end_event.record()
+                        torch.cuda.synchronize()
+                        time = start_event.elapsed_time(end_event)
+                        latency_set.append(time)
+
+                print(prof.key_averages(group_by_stack_n=1).table(sort_by=sort_by_keyword, row_limit=50))
+                prof.export_chrome_trace(str(model_name.split("/")[1])+"_"+str(module)+"_tp"+str(tp)+"_trace.json")
+            else:
+                for itr in range(iters):
+                    start_event = torch.cuda.Event(enable_timing=True)
+                    end_event = torch.cuda.Event(enable_timing=True)
+                    torch.cuda.synchronize()
+                    start_event.record()
+
+                    #out = F.linear(x, wT)
+                    out = dispatch_unquantized_gemm()(x, wT, None)
+
+                    end_event.record()
+                    torch.cuda.synchronize()
+                    time = start_event.elapsed_time(end_event)
+                    latency_set.append(time)
 
         latency_set = latency_set[warmup:]
         latency_avg = sum(latency_set) / len(latency_set)
-        tflops = x0 * x1 * w1 * 2 /1e9/(latency_avg) 
+        gflops = x0 * x1 * w1 * 2 /1e9
+        tflops_sec = x0 * x1 * w1 * 2 /1e9/(latency_avg)
         ddr_access = data_in_byte * (x0 * x1 + w0 * w1 + x0 * w1)
 
-        arith_intensity = (x0 * x1 * w1 * 2) / ddr_access 
-        print("{}:{}:{}:{}:{}".format(module, x.shape, wT.shape, tflops, arith_intensity))
+        arith_intensity = (x0 * x1 * w1 * 2) / ddr_access
+        print("{}:{}:{}:{}:{}:{}:{}".format(module, bs*sl, x.shape, wT.shape, gflops, tflops_sec, arith_intensity))
+
